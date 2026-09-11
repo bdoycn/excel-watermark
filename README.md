@@ -164,12 +164,14 @@ canvas 只能拿到日文/韩文字体（例如 macOS 上 `PingFang SC` 无法�
 
 ### 各方案的边界（来自开源社区与实测）
 
-xlsx 文件格式里没有「水印」这个概念（Apache POI 专家 Axel Richter：*Watermark functionality is not available in Microsoft Excel*），所有方案都是模仿，各有硬限制：
+xlsx 文件格式里没有「水印」这个概念——Apache POI 社区答主 Axel Richter 说得最直白：
+*"Watermark functionality is not available in Microsoft Excel."*（[Stack Overflow 原帖](https://stackoverflow.com/a/68559074)），
+所以下面所有方案都是对水印的「模仿」，各有硬限制：
 
 | 方案 | 屏幕可见 | 打印 | 吃鼠标 | 结论 |
 | --- | --- | --- | --- | --- |
-| 工作表背景图 `<picture>` | 仅**普通视图** | ✗（Excel 设计如此） | 不吃 | **屏幕首选** |
-| 页眉图片 `&G` + VML | 页面布局 / 打印预览 | ✓ 整页 | 不吃 | **打印首选**（xlsxwriter 作者称其为 best way） |
+| 工作表背景图 `<picture>` | 仅**普通视图** | ✗（[Microsoft：无法打印工作表背景图形](https://support.microsoft.com/en-us/topic/you-cannot-print-a-background-graphic-for-a-excel-worksheet-7b1bbe1b-c672-a1bc-99e1-fb9eb8af5c45)） | 不吃 | **屏幕首选** |
+| 页眉图片 `&G` + VML | 页面布局 / 打印预览 | ✓ 整页 | 不吃 | **打印首选**（[Microsoft 官方推荐的水印做法](https://support.microsoft.com/en-us/office/add-a-watermark-in-excel-a372182a-d733-484e-825c-18ddf3edf009)，[XlsxWriter 官方示例](https://xlsxwriter.readthedocs.io/example_watermark.html)采用的正是「页眉放图片」） |
 | 浮动文字 / 图片 | 所有视图（含护眼模式） | ✓ | **吃** | 仅在「必须任意视图可见」时用 |
 | 背景图 + 保护工作表锁对象 | 同上 | 同上 | 对象选不中，但点击仍被对象接住 | 缓解不能拖动/误选 |
 
@@ -215,8 +217,16 @@ Excel 完全不认识这个命名空间，只会用第 1 项的背景图。本�
 4. `headerFooter` 设置 `scaleWithDoc="0"`，这样即使工作表设置了缩放（例如 `scale="53%"`）或「调整为 1 页宽」，
    页眉水印仍按实际纸张尺寸打印
 
-这条路径与 xlsxwriter 输出的 VML 结构逐字节一致（xlsxwriter 的页眉图片是 Excel 验证过的实现），
-并且不是浮动对象，所以打印有图、鼠标不受影响。
+这条路径与 xlsxwriter 的页眉图片实现结构一致（xlsxwriter 3.2.9 的输出实测对比：`shapelayout → shapetype
+_x0000_t75 → shape id="CH" → imagedata → lock` 的元素序列与属性集合完全相同），差异只有三处且均为有意为之：
+
+| 差异 | xlsxwriter | 本工具 | 原因 |
+| --- | --- | --- | --- |
+| `o:title` | `_wm`（取自图片文件名） | `Watermark` | 用固定名称，便于在「选择窗格」里识别 |
+| `width` / `height` | `270pt` / `150pt`（源图 360×200 px 在 96 DPI 下的原始尺寸） | 按纸张可打印区域计算 | 目标是整页铺满，不是角落放一个 logo |
+| `scaleWithDoc` | 未写（Excel 默认 `1`） | `"0"` | 工作表缩放时页眉水印仍按实际纸张尺寸打印 |
+
+并且它不是浮动对象，所以打印有图、鼠标不受影响。
 
 ### 打印水印（页眉文字）
 
@@ -314,6 +324,22 @@ Excel 用户得到「普通视图可见 + 打印可见」，互不干扰。
 
 **端口被占用？**
 `PORT=8080 npm start`，或先结束占用进程。
+
+## 参考资料
+
+水印相关实现与限制的出处（整理时已逐条访问核对，链接均为 200）：
+
+| 资料 | 用途 |
+| --- | --- |
+| [Microsoft：Add a watermark in Excel](https://support.microsoft.com/en-us/office/add-a-watermark-in-excel-a372182a-d733-484e-825c-18ddf3edf009) | 官方给出的水印做法：在页眉/页脚插入图片 |
+| [Microsoft：You cannot print a background graphic for a Excel worksheet](https://support.microsoft.com/en-us/topic/you-cannot-print-a-background-graphic-for-a-excel-worksheet-7b1bbe1b-c672-a1bc-99e1-fb9eb8af5c45) | 背景图无法打印（Excel 设计如此） |
+| [Microsoft：Add or remove a sheet background](https://support.microsoft.com/en-us/office/add-or-remove-a-sheet-background-3577a762-8450-4556-96a2-cc265abc00a8) | 工作表背景图的行为说明 |
+| [Stack Overflow：Apache POI - watermark in Excel（Axel Richter 的回答）](https://stackoverflow.com/a/68559074) | 「Excel 里没有水印功能」及各类模仿方案的取舍 |
+| [Stack Overflow：Apache POI - adding watermark in Excel workbook（Axel Richter 的回答）](https://stackoverflow.com/a/51103756) | 用页眉/页脚图片模仿水印（打印水印）的做法 |
+| [XlsxWriter：Example: Setting a Worksheet Watermark](https://xlsxwriter.readthedocs.io/example_watermark.html) | Python 版「页眉图片水印」参考实现；本工具用 xlsxwriter 3.2.9 生成对照文件做结构比对 |
+| [rust_xlsxwriter：Adding a watermark as a header image](https://rustxlsxwriter.github.io/examples/watermark.html) | 同一做法的 Rust 实现，供交叉参考 |
+
+> WPS 私有水印（`customXml` + `etCustomData`）没有公开规范，本文档中的结构说明来自对 WPS 自身输出文件的解包分析，属实测结论。
 
 ## 许可证
 
