@@ -26,10 +26,12 @@ const CONFIG_FALLBACK = {
   bold: true,
   italic: false,
   border: false,
-  background: false,
-  overlay: true,
+  background: true,
+  overlay: false,
   switchToNormalView: true,
-  printHeader: true,
+  printImage: true,
+  printHeader: false,
+  wpsWatermark: true,
   headerFontSize: 22,
   headerFont: '宋体',
   sheets: 'all',
@@ -171,10 +173,13 @@ function readConfig() {
     bold: $('wm-bold').checked,
     italic: $('wm-italic').checked,
     border: $('wm-border').checked,
-    overlay: selectedPosition() === 'overlay',
+    overlay: selectedPosition() !== 'background',
+    overlayType: selectedPosition() === 'overlay-image' ? 'image' : 'text',
     background: selectedPosition() === 'background',
     switchToNormalView: $('wm-normal-view').checked,
-    printHeader: $('wm-print').checked,
+    printImage: selectedPrintMode() === 'image',
+    printHeader: selectedPrintMode() === 'text',
+    wpsWatermark: $('wm-wps').checked,
     headerFontSize: Number($('wm-print-size').value),
     headerFont: $('wm-print-font').value,
     sheets: allSelected ? 'all' : [...state.selected],
@@ -191,28 +196,50 @@ function syncRangeOutputs() {
 /** 水印位置：覆盖在单元格上方 / 位于单元格后方 */
 function selectedPosition() {
   const checked = document.querySelector('input[name="wm-position"]:checked');
-  return checked ? checked.value : 'overlay';
+  return checked ? checked.value : 'background';
 }
 
 function setPosition(value) {
-  const target = value === 'background' ? $('wm-background') : $('wm-overlay');
-  target.checked = true;
+  const map = {
+    background: 'wm-background',
+    overlay: 'wm-overlay',
+    'overlay-image': 'wm-overlay-image',
+  };
+  $(map[value] || 'wm-background').checked = true;
   updatePositionState();
 }
 
 function updatePositionState() {
-  const isBackground = selectedPosition() === 'background';
+  const position = selectedPosition();
+  const isBackground = position === 'background';
   $('normal-view-row').hidden = !isBackground;
+  $('overlay-warning').hidden = position !== 'overlay-image';
   $('watermark-layer').classList.toggle('is-overlay', !isBackground);
 }
 
+/** 打印水印方式：image（页眉图片）/ text（页眉文字）/ none */
+function selectedPrintMode() {
+  const checked = document.querySelector('input[name="wm-print"]:checked');
+  return checked ? checked.value : 'image';
+}
+
+function setPrintMode(mode) {
+  const target =
+    mode === 'text' ? $('wm-print-text') : mode === 'none' ? $('wm-print-none') : $('wm-print-image');
+  target.checked = true;
+  setPrintOptionsState();
+}
+
 function setPrintOptionsState() {
-  const enabled = $('wm-print').checked;
-  $('print-options').classList.toggle('is-muted', !enabled);
-  $('print-options').setAttribute('aria-disabled', String(!enabled));
-  $('wm-print-font').disabled = !enabled;
-  $('wm-print-size').disabled = !enabled;
-  $('print-preview-block').classList.toggle('is-hidden', !enabled);
+  const mode = selectedPrintMode();
+  const isText = mode === 'text';
+  $('print-options').classList.toggle('is-muted', !isText);
+  $('print-options').setAttribute('aria-disabled', String(!isText));
+  $('wm-print-font').disabled = !isText;
+  $('wm-print-size').disabled = !isText;
+  $('print-preview-block').classList.toggle('is-hidden', mode === 'none');
+  $('print-preview-title').textContent =
+    mode === 'image' ? '打印水印（页眉图片，每页铺满）' : '打印水印（页眉文字）';
 }
 
 function ensureFontOption(value) {
@@ -252,9 +279,16 @@ function syncForm(config) {
   $('wm-bold').checked = Boolean(config.bold);
   $('wm-italic').checked = Boolean(config.italic);
   $('wm-border').checked = Boolean(config.border);
-  setPosition(config.overlay === false && config.background ? 'background' : 'overlay');
+  setPosition(
+    config.overlay
+      ? config.overlayType === 'image'
+        ? 'overlay-image'
+        : 'overlay'
+      : 'background',
+  );
   $('wm-normal-view').checked = config.switchToNormalView !== false;
-  $('wm-print').checked = Boolean(config.printHeader);
+  setPrintMode(config.printImage !== false ? 'image' : config.printHeader ? 'text' : 'none');
+  $('wm-wps').checked = config.wpsWatermark !== false;
   $('wm-print-size').value = config.headerFontSize;
   $('wm-print-font').value = config.headerFont;
   syncRangeOutputs();
@@ -426,21 +460,35 @@ function updatePreviewMetaOnly() {
   updateActionState();
 }
 
-function updatePrintPreview(config) {
+function updatePrintPreview(config, tileUrl) {
+  const mode = selectedPrintMode();
+  const mock = $('page-mock');
   const node = $('page-header-preview');
+
+  if (mode === 'image') {
+    // 图片水印：整页平铺同一张水印图，与打印结果一致
+    mock.classList.add('is-image-watermark');
+    mock.style.backgroundImage = tileUrl ? `url("${tileUrl}")` : 'none';
+    node.hidden = true;
+    node.textContent = '';
+    return;
+  }
+
+  mock.classList.remove('is-image-watermark');
+  mock.style.backgroundImage = '';
+  node.hidden = false;
   const text = (config.text || '').replace(/\n+/g, ' ').trim();
   node.textContent = text || '（无文字）';
   node.style.fontSize = `${Math.round(config.headerFontSize * (96 / 72))}px`;
   node.style.color = config.color;
   node.style.fontWeight = config.bold ? '700' : '600';
   node.style.fontStyle = config.italic ? 'italic' : 'normal';
-  node.style.fontFamily = `var(--doc-font, inherit)`;
   node.style.opacity = String(Math.min(1, config.opacity + 0.35));
 }
 
 async function updatePreview() {
   const config = readConfig();
-  updatePrintPreview(config);
+  updatePrintPreview(config, state.previewUrl);
 
   const layer = $('watermark-layer');
   const text = (config.text || '').trim();
@@ -472,6 +520,7 @@ async function updatePreview() {
     if (state.previewUrl) URL.revokeObjectURL(state.previewUrl);
     state.previewUrl = url;
     layer.style.backgroundImage = `url("${url}")`;
+    updatePrintPreview(config, url);
 
     const fontFamily = decodeURIComponent(res.headers.get('X-Watermark-Font') || '');
     const fontFallback = res.headers.get('X-Watermark-Font-Fallback') === '1';
@@ -525,7 +574,7 @@ async function generate() {
   if (!state.file || state.busy) return;
   const config = readConfig();
 
-  if (!config.overlay && !config.background && !config.printHeader) {
+  if (!config.overlay && !config.background && !config.printImage && !config.printHeader) {
     toast('请至少开启一种水印方式', 'error');
     return;
   }
@@ -656,9 +705,11 @@ function bindEvents() {
     });
   });
   $('wm-normal-view').addEventListener('change', () => schedulePreview(0));
-  $('wm-print').addEventListener('change', () => {
-    setPrintOptionsState();
-    updatePreview();
+  document.querySelectorAll('input[name="wm-print"]').forEach((radio) => {
+    radio.addEventListener('change', () => {
+      setPrintOptionsState();
+      updatePreview();
+    });
   });
 
   $('text-presets').addEventListener('click', (event) => {

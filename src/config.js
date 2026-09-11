@@ -19,14 +19,28 @@ export const WATERMARK_DEFAULTS = {
   italic: false,
   /** 文字外框 */
   border: false,
-  /** 单元格后方的背景水印（只在普通视图可见，不打印） */
-  background: false,
-  /** 覆盖在单元格上方的浮动图片水印（任何视图都可见，会随文件打印） */
-  overlay: true,
+  /** 单元格后方的背景水印：不遮挡数据、不拦截鼠标（只在普通视图可见，不打印） */
+  background: true,
+  /** 覆盖在单元格上方的浮动水印：护眼模式下也能看到，但浮动对象可能拦截鼠标点击 */
+  overlay: false,
+  /** 浮动水印的形式：text（艺术字，真文字）/ image（平铺图片） */
+  overlayType: 'text',
+  /** 保护工作表并锁定水印对象：水印不能被选中/拖动，鼠标点击落到单元格（单元格已全部解锁，仍可编辑） */
+  lockObjects: false,
   /** 使用背景水印时，把分页预览/页面布局视图改回普通视图，否则看不到背景图 */
   switchToNormalView: true,
-  /** 页眉文字水印（打印时显示） */
-  printHeader: true,
+  /** 打开文件时的视图：auto / keep / normal / pageLayout / pageBreakPreview
+   *  auto = 有背景水印→普通视图；只有页眉图片水印→页面布局视图（打开即可见、且不吃鼠标） */
+  viewMode: 'auto',
+  /** 打印水印：把平铺水印图作为页眉图片（&G）写入，每页打印都出现，且不拦截鼠标 */
+  printImage: true,
+  /** 打印水印：页眉居中文字（可选，默认关闭；图片水印本身已包含文字） */
+  printHeader: false,
+  /** 实验性：写入 WPS 私有水印元数据（customXml etCustomData）。
+   *  实测 WPS 12.1 不读取外部写入的这段描述（B 文件零水印已验证），默认关闭 */
+  wpsWatermark: false,
+  /** WPS 元数据里是否标记背景图为「待重建」（与 WPS 自己的输出一致） */
+  wpsInvalidateBgImgs: true,
   headerFontSize: 22,
   headerFont: '宋体',
   /** 'all' 或工作表名称数组 */
@@ -127,7 +141,23 @@ export function normalizeConfig(raw = {}) {
     border: toBool(raw.border, WATERMARK_DEFAULTS.border),
     background: toBool(raw.background, WATERMARK_DEFAULTS.background),
     overlay: toBool(raw.overlay, WATERMARK_DEFAULTS.overlay),
+    overlayType: String(raw.overlayType || WATERMARK_DEFAULTS.overlayType).toLowerCase() === 'image'
+      ? 'image'
+      : 'text',
+    lockObjects: toBool(raw.lockObjects, WATERMARK_DEFAULTS.lockObjects),
     switchToNormalView: toBool(raw.switchToNormalView, WATERMARK_DEFAULTS.switchToNormalView),
+    viewMode: (() => {
+      const value = String(raw.viewMode || WATERMARK_DEFAULTS.viewMode).toLowerCase();
+      return ['auto', 'keep', 'normal', 'pagelayout', 'pagebreakpreview'].includes(value)
+        ? value
+        : 'auto';
+    })(),
+    printImage: toBool(raw.printImage, WATERMARK_DEFAULTS.printImage),
+    wpsWatermark: toBool(raw.wpsWatermark, WATERMARK_DEFAULTS.wpsWatermark),
+    wpsInvalidateBgImgs: toBool(
+      raw.wpsInvalidateBgImgs,
+      WATERMARK_DEFAULTS.wpsInvalidateBgImgs,
+    ),
     printHeader: toBool(raw.printHeader, WATERMARK_DEFAULTS.printHeader),
     headerFontSize: Math.round(
       toNumber(raw.headerFontSize, LIMITS.headerFontSize, WATERMARK_DEFAULTS.headerFontSize),
@@ -139,9 +169,17 @@ export function normalizeConfig(raw = {}) {
   if (!config.text) {
     throw new Error('水印内容不能为空');
   }
-  if (!config.background && !config.overlay && !config.printHeader) {
-    throw new Error('至少需要开启一种水印方式（覆盖水印、背景水印或打印水印）');
+  if (
+    !config.background &&
+    !config.overlay &&
+    !config.printImage &&
+    !config.printHeader &&
+    !config.wpsWatermark
+  ) {
+    throw new Error('至少需要开启一种水印方式（背景水印、覆盖水印或打印水印）');
   }
+  // 页眉图片与页眉文字同时开启时，只保留图片（图片里已经有文字，避免重复）
+  if (config.printImage && config.printHeader) config.printHeader = false;
   return config;
 }
 

@@ -61,6 +61,152 @@ async function assertOverlayStructure(buffer, { baseline }) {
   return info;
 }
 
+/** WPS 原生水印元数据断言（结构对齐 WPS 自己的输出） */
+async function assertWpsMetadata(buffer, { sheetCount }) {
+  const zip = await JSZip.loadAsync(buffer);
+  const item = zip.file('customXml/item1.xml');
+  assert.ok(item, '缺少 customXml/item1.xml');
+  const xml = await item.async('string');
+
+  assert.ok(
+    xml.includes('http://www.wps.cn/officeDocument/2017/etCustomData'),
+    'customXml 缺少 WPS etCustomData 命名空间',
+  );
+  assert.match(xml, /<watermark type="0">/, '缺少 watermark 节点');
+  assert.match(
+    xml,
+    /<text fontName="[^"]+" angle="-?\d+" fontSize="[\d.]+" opacity="[\d.]+">/,
+    'text 节点属性不符合 WPS 格式',
+  );
+  assert.match(xml, /<v>[^<]+<\/v>/, '缺少水印文字');
+  const stIds = [...xml.matchAll(/<invalidBgImg stId="(\d+)" hash="([0-9a-f]{32})"\/>/g)];
+  assert.equal(stIds.length, sheetCount, 'invalidBgImgs 应覆盖全部已处理工作表');
+  if (sheetCount === 0) assert.ok(!xml.includes('<invalidBgImgs>'));
+
+  const props = await zip.file('customXml/itemProps1.xml').async('string');
+  assert.match(props, /<ds:datastoreItem ds:itemID="\{[0-9A-F-]{36}\}"/, 'itemProps 缺少 itemID');
+  assert.match(props, /etCustomData/, 'itemProps 缺少 schemaRef');
+
+  const rels = await zip.file('customXml/_rels/item1.xml.rels').async('string');
+  assert.match(rels, /customXmlProps/, 'item1 关系缺少 customXmlProps');
+
+  // 关键：WPS 通过 xl/_rels/workbook.xml.rels 找到水印部件，缺这条关系 WPS 完全不画水印
+  const workbookRels = await zip.file('xl/_rels/workbook.xml.rels').async('string');
+  const customXmlRel = (workbookRels.match(/<Relationship\b[^>]*\/?>/g) || []).filter((tag) =>
+    /relationships\/customXml"/.test(tag),
+  );
+  assert.equal(customXmlRel.length, 1, 'workbook 关系里应有且仅有 1 条 customXml');
+  assert.match(customXmlRel[0], /Target="\.\.\/customXml\/item1\.xml"/, 'customXml 目标路径不对');
+
+  const contentTypes = await zip.file('[Content_Types].xml').async('string');
+  assert.match(contentTypes, /PartName="\/customXml\/itemProps1\.xml"/, '缺少 itemProps 内容类型');
+  return xml;
+}
+
+/** 浮动文字水印（艺术字文本框）结构断言 */
+async function assertOverlayTextStructure(buffer) {
+  const info = await inspect(buffer);
+  let shapes = 0;
+
+  for (const [part, xml] of info.sheets) {
+    const root = parseDocument(xml);
+    const drawings = findChildren(root, 'drawing');
+    assert.equal(drawings.length, 1, `${part}: 应有 1 个 <drawing>`);
+
+    const rid = getRelationshipId(drawings[0].openTag);
+    const relsPath = part.replace('xl/worksheets/', 'xl/worksheets/_rels/') + '.rels';
+    const relsXml = await info.zip.file(relsPath).async('string');
+    const relTag = (relsXml.match(/<Relationship\b[^>]*\/?>/g) || []).find(
+      (tag) => getAttr(tag, 'Id') === rid,
+    );
+    assert.ok(relTag, `${part}: drawing 关系不存在`);
+
+    const drawingPart = resolveTarget(part, getAttr(relTag, 'Target'));
+    const drawingXml = await info.zip.file(drawingPart).async('string');
+
+    const anchors =
+      drawingXml.match(/<(?:\w+:)?oneCellAnchor\b[\s\S]*?<\/(?:\w+:)?oneCellAnchor\s*>/g) || [];
+    const watermarks = anchors.filter((block) => /name="Watermark"/.test(block));
+    assert.equal(watermarks.length, 1, `${drawingPart}: 文字水印锚点应只有 1 个`);
+    shapes += 1;
+
+    const block = watermarks[0];
+    assert.match(block, /<(?:\w+:)?sp\b/, `${drawingPart}: 锚点里应是文本框`);
+    assert.ok(!/<a:blip\b/.test(block), `${drawingPart}: 文字水印不应引用图片`);
+    assert.match(block, /<a:noFill\/>/, `${drawingPart}: 文本框必须无填充（否则会挡住整块区域）`);
+    assert.match(block, /<a:ln><a:noFill\/><\/a:ln>/, `${drawingPart}: 文本框必须无边框`);
+    assert.match(block, /<a:xfrm rot="-?\d+">/, `${drawingPart}: 缺少旋转角度`);
+    assert.match(block, /<a:t>[^<]+<\/a:t>/, `${drawingPart}: 缺少水印文字`);
+    assert.match(block, /<a:srgbClr val="[0-9A-F]{6}"><a:alpha val="\d+"\/>/, `${drawingPart}: 缺少颜色/透明度`);
+  }
+  assert.ok(shapes > 0, '没有写入任何浮动文字水印');
+  return info;
+}
+
+/** 打印水印（页眉图片 &G + VML）结构断言 */
+async function assertPrintImageStructure(buffer) {
+  const info = await inspect(buffer);
+  assert.match(info.contentTypes, /<Default[^>]*Extension="vml"/i, '缺少 vml 内容类型');
+
+  let shapes = 0;
+  for (const [part, xml] of info.sheets) {
+    const root = parseDocument(xml);
+    const names = root.children.map((child) => child.name);
+
+    const legacyHf = findChildren(root, 'legacyDrawingHF');
+    assert.equal(legacyHf.length, 1, `${part}: 应有且仅有 1 个 <legacyDrawingHF>`);
+    const headerFooter = findChildren(root, 'headerFooter')[0];
+    assert.ok(headerFooter, `${part}: 缺少 <headerFooter>`);
+    assert.ok(
+      unescapeXml(headerFooter.inner).includes('&G'),
+      `${part}: 页眉里缺少 &G 图片占位`,
+    );
+    assert.match(headerFooter.openTag, /scaleWithDoc="0"/, `${part}: 应关闭「随文档缩放」`);
+
+    const hfIndex = names.indexOf('legacyDrawingHF');
+    for (const later of ['drawingHF', 'picture', 'oleObjects', 'controls', 'tableParts', 'extLst']) {
+      const index = names.indexOf(later);
+      if (index !== -1) assert.ok(hfIndex < index, `${part}: <legacyDrawingHF> 应在 <${later}> 之前`);
+    }
+
+    const rid = getRelationshipId(legacyHf[0].openTag);
+    const relsPath = part.replace('xl/worksheets/', 'xl/worksheets/_rels/') + '.rels';
+    const relsXml = await info.zip.file(relsPath).async('string');
+    const relTag = (relsXml.match(/<Relationship\b[^>]*\/?>/g) || []).find(
+      (tag) => getAttr(tag, 'Id') === rid,
+    );
+    assert.ok(relTag, `${part}: 页眉 VML 关系 ${rid} 不存在`);
+    assert.ok(getAttr(relTag, 'Type').endsWith('/vmlDrawing'), `${part}: 关系类型不是 vmlDrawing`);
+
+    const vmlPart = resolveTarget(part, getAttr(relTag, 'Target'));
+    const vmlFile = info.zip.file(vmlPart);
+    assert.ok(vmlFile, `${part}: 缺少 VML 部件 ${vmlPart}`);
+    const vml = await vmlFile.async('string');
+
+    const shape = /<v:shape\b[^>]*id="CH"[\s\S]*?<\/v:shape>/.exec(vml);
+    assert.ok(shape, `${vmlPart}: 缺少居中页眉形状 CH`);
+    shapes += 1;
+
+    const width = /width:([\d.]+)pt/.exec(shape[0]);
+    const height = /height:([\d.]+)pt/.exec(shape[0]);
+    assert.ok(width && Number(width[1]) > 200, `${vmlPart}: 打印水印宽度过小`);
+    assert.ok(height && Number(height[1]) > 200, `${vmlPart}: 打印水印高度过小`);
+
+    const embed = /o:relid="([^"]+)"/.exec(shape[0]);
+    assert.ok(embed, `${vmlPart}: 缺少图片引用`);
+    const vmlRelsPart = vmlPart.replace('xl/drawings/', 'xl/drawings/_rels/') + '.rels';
+    const vmlRels = await info.zip.file(vmlRelsPart).async('string');
+    const imageRel = (vmlRels.match(/<Relationship\b[^>]*\/?>/g) || []).find(
+      (tag) => getAttr(tag, 'Id') === embed[1],
+    );
+    assert.ok(imageRel, `${vmlPart}: 图片关系 ${embed[1]} 不存在`);
+    const imagePart = resolveTarget(vmlPart, getAttr(imageRel, 'Target'));
+    assert.ok(info.zip.file(imagePart), `${vmlPart}: 图片 ${imagePart} 不存在`);
+  }
+  assert.ok(shapes > 0, '没有写入任何打印水印');
+  return info;
+}
+
 /**
  * 端到端测试：给测试文件加水印，并验证
  *   1. 结构正确（<picture> / <headerFooter> 位置、关系、内容类型）
@@ -91,7 +237,7 @@ import {
   resolveFontFamily,
   listAvailableFonts,
 } from '../src/watermark-image.js';
-import { parseDocument, findChildren, getAttr, getRelationshipId } from '../src/xml.js';
+import { parseDocument, findChildren, getAttr, getRelationshipId, unescapeXml } from '../src/xml.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURES = path.join(HERE, 'fixtures');
@@ -139,10 +285,86 @@ const CASES = [
     },
   },
   {
+    name: 'view-pagelayout',
+    config: {
+      text: '页面布局视图',
+      background: false,
+      overlay: false,
+      printImage: true,
+      printHeader: false,
+      wpsWatermark: false,
+      viewMode: 'pageLayout',
+      sheets: 'all',
+    },
+  },
+  {
+    name: 'locked-objects',
+    config: {
+      text: '锁定对象',
+      background: false,
+      overlay: true,
+      overlayType: 'text',
+      printImage: true,
+      printHeader: false,
+      wpsWatermark: false,
+      lockObjects: true,
+      sheets: 'all',
+    },
+  },
+  {
+    name: 'print-image',
+    config: {
+      text: '打印图水印',
+      background: true,
+      overlay: false,
+      printImage: true,
+      printHeader: false,
+      fontSize: 40,
+      sheets: 'all',
+    },
+  },
+  {
+    name: 'print-image-only',
+    config: {
+      text: '仅打印图',
+      background: false,
+      overlay: false,
+      printImage: true,
+      printHeader: false,
+      sheets: 'all',
+    },
+  },
+  {
+    name: 'overlay-text',
+    config: {
+      text: '文字覆盖水印',
+      overlay: true,
+      overlayType: 'text',
+      background: false,
+      printImage: true,
+      printHeader: false,
+      fontSize: 40,
+      sheets: 'all',
+    },
+  },
+  {
+    name: 'overlay-text-only',
+    config: {
+      text: '仅文字覆盖',
+      overlay: true,
+      overlayType: 'text',
+      background: false,
+      printImage: false,
+      printHeader: false,
+      sheets: 'all',
+    },
+  },
+  {
     name: 'overlay-print',
     config: {
       text: '覆盖水印 请勿外传',
       overlay: true,
+      overlayType: 'image',
       background: false,
       printHeader: true,
       fontSize: 38,
@@ -154,6 +376,7 @@ const CASES = [
     config: {
       text: '全都要',
       overlay: true,
+      overlayType: 'image',
       background: true,
       printHeader: true,
       sheets: 'all',
@@ -244,6 +467,76 @@ async function assertStructure(buffer, { background, baseline }) {
     }
   }
   return info;
+}
+
+/** WPS 原生水印元数据相关测试 */
+async function verifyWpsMetadata() {
+  console.log('=== WPS 原生水印元数据 ===');
+  const input = await readFile(path.join(FIXTURES, 'fixture-openpyxl.xlsx'));
+  const base = {
+    text: '请勿外传',
+    background: true,
+    overlay: false,
+    printImage: true,
+    wpsWatermark: true,
+    fontFamily: 'PingFang SC',
+    sheets: 'all',
+  };
+  const once = await watermarkWorkbook(input, normalizeConfig(base));
+  const twice = await watermarkWorkbook(once.buffer, normalizeConfig(base));
+  await writeFile(path.join(OUT, 'verify-wps.xlsx'), once.buffer);
+
+  await check('写入 WPS 水印元数据（结构对齐 WPS 原生输出）', async () => {
+    const xml = await assertWpsMetadata(once.buffer, { sheetCount: 4 });
+    assert.match(xml, /<v>请勿外传<\/v>/);
+    assert.match(xml, /fontName="PingFang SC"/);
+  });
+
+  await check('重复生成复用同一部件，不会堆叠 customXml', async () => {
+    const zip = await JSZip.loadAsync(twice.buffer);
+    const items = Object.keys(zip.files).filter((name) => /^customXml\/item\d+\.xml$/.test(name));
+    assert.deepEqual(items, ['customXml/item1.xml']);
+    const xml = await zip.file('customXml/item1.xml').async('string');
+    assert.equal((xml.match(/<watermarks/g) || []).length, 1, 'watermarks 节点重复');
+  });
+
+  await check('可以不带 invalidBgImgs', async () => {
+    const variant = await watermarkWorkbook(
+      input,
+      normalizeConfig({ ...base, wpsInvalidateBgImgs: false }),
+    );
+    const xml = await assertWpsMetadata(variant.buffer, { sheetCount: 0 });
+    assert.ok(!xml.includes('<invalidBgImgs>'), '不应包含 invalidBgImgs');
+  });
+
+  await check('可以关闭 WPS 元数据', async () => {
+    const off = await watermarkWorkbook(
+      input,
+      normalizeConfig({ ...base, wpsWatermark: false }),
+    );
+    const zip = await JSZip.loadAsync(off.buffer);
+    const items = Object.keys(zip.files).filter((name) => name.startsWith('customXml/'));
+    assert.deepEqual(items, [], '关闭后不应写入 customXml');
+  });
+
+  await check('带 WPS 元数据的文件仍可被三方库读取', async () => {
+    // 用 ExcelJS 也能解析的样本来验证（openpyxl 生成的图表锚点 ExcelJS 本身就解析不了）
+    const source = await readFile(path.join(FIXTURES, 'fixture-xlsxwriter.xlsx'));
+    const output = await watermarkWorkbook(source, normalizeConfig(base));
+    const excelWb = new ExcelJS.Workbook();
+    await excelWb.xlsx.load(output.buffer);
+    assert.deepEqual(excelWb.worksheets.map((ws) => ws.name), ['带表格', '普通表']);
+    const sheetWb = XLSX.read(output.buffer, { type: 'buffer' });
+    const before = XLSX.read(source, { type: 'buffer' });
+    assert.deepEqual(sheetWb.SheetNames, before.SheetNames);
+    for (const name of before.SheetNames) {
+      assert.deepEqual(
+        XLSX.utils.sheet_to_json(sheetWb.Sheets[name], { header: 1 }),
+        XLSX.utils.sheet_to_json(before.Sheets[name], { header: 1 }),
+        `工作表 ${name} 数据变化`,
+      );
+    }
+  });
 }
 
 /** 把 PNG 画到画布上做像素统计，用于校验水印图片本身 */
@@ -347,6 +640,56 @@ async function verifyWatermarkImage() {
     assert.ok(fonts.some((font) => font.label.includes('推荐')), '缺少推荐的中文字体');
   });
 
+  await check('viewMode/pageLayout 会写进工作表视图', async () => {
+    const input = await readFile(path.join(FIXTURES, 'fixture-minimal.xlsx'));
+    for (const [mode, expected, absent] of [
+      ['pageLayout', /view="pageLayout"/, null],
+      ['normal', null, /view="pageLayout"/],
+    ]) {
+      const out = await watermarkWorkbook(
+        input,
+        normalizeConfig({ text: '视图', background: false, overlay: false, printImage: true, viewMode: mode }),
+      );
+      const zip = await JSZip.loadAsync(out.buffer);
+      const sheet = await zip.file('xl/worksheets/sheet1.xml').async('string');
+      const view = /<sheetView\b[^>]*>/.exec(sheet)[0];
+      if (expected) assert.match(view, expected);
+      if (absent) assert.doesNotMatch(view, absent);
+    }
+  });
+
+  await check('lockObjects 会解锁所有单元格并保护工作表', async () => {
+    const input = await readFile(path.join(FIXTURES, 'fixture-xlsxwriter.xlsx'));
+    const out = await watermarkWorkbook(
+      input,
+      normalizeConfig({ text: '锁定', overlay: true, overlayType: 'text', background: false, lockObjects: true }),
+    );
+    const zip = await JSZip.loadAsync(out.buffer);
+    const styles = await zip.file('xl/styles.xml').async('string');
+    const section = styles.match(/<cellXfs\b[^>]*>[\s\S]*?<\/cellXfs>/)[0];
+    const xfCount = (section.match(/<xf\b/g) || []).length;
+    assert.equal(
+      (section.match(/<protection locked="0"\/>/g) || []).length,
+      xfCount,
+      '每个单元格样式都应带 protection locked=0',
+    );
+    const sheet = await zip.file('xl/worksheets/sheet1.xml').async('string');
+    const protection = /<sheetProtection[^>]*\/>/.exec(sheet);
+    assert.ok(protection, '缺少 sheetProtection');
+    assert.match(protection[0], /sheet="1"/);
+    assert.match(protection[0], /objects="1"/, '必须锁定对象');
+    assert.match(protection[0], /formatCells="0"/, '应放开单元格格式化');
+  });
+
+  await check('默认配置不会拦截鼠标点击（默认走背景水印）', () => {
+    const cfg = normalizeConfig({ text: '内部资料' });
+    assert.equal(cfg.overlay, false, '默认不应使用浮动图片水印');
+    assert.equal(cfg.background, true);
+    assert.equal(cfg.printHeader, false, '默认用页眉图片水印');
+    assert.equal(cfg.printImage, true, '默认开启打印水印');
+    assert.equal(cfg.switchToNormalView, true);
+  });
+
   await check('极小间距也不会生成超大图片', () => {
     const dense = renderWatermarkTile(
       normalizeConfig({ text: '内部资料请勿外传内部资料', fontSize: 200, gap: 0 }),
@@ -359,6 +702,7 @@ async function main() {  await rm(OUT, { recursive: true, force: true });
   await mkdir(OUT, { recursive: true });
 
   await verifyWatermarkImage();
+  await verifyWpsMetadata();
 
   if (!(await readdir(FIXTURES).catch(() => [])).length) {
     console.log('生成测试文件…');
@@ -409,18 +753,29 @@ async function main() {  await rm(OUT, { recursive: true, force: true });
         if (config.background || config.overlay) {
           await assertStructure(result.buffer, { background: config.background, baseline });
         }
-        if (config.overlay) {
+        if (config.overlay && config.overlayType === 'text') {
+          await assertOverlayTextStructure(result.buffer);
+          assert.deepEqual(result.overlays, result.applied, '覆盖水印应写入所有已处理的工作表');
+        } else if (config.overlay) {
           await assertOverlayStructure(result.buffer, { baseline });
           assert.deepEqual(result.overlays, result.applied, '覆盖水印应写入所有已处理的工作表');
         } else {
           assert.deepEqual(result.overlays, [], '未开启覆盖水印时不应写 drawing');
         }
         if (config.background) assert.ok(result.tile && result.tile.width > 0, '缺少背景水印图片信息');
+        if (config.printImage) {
+          await assertPrintImageStructure(result.buffer);
+          assert.deepEqual(result.printImages, result.applied, '打印水印应写入所有已处理的工作表');
+        } else {
+          assert.deepEqual(result.printImages, [], '未开启打印水印时不应写 VML 页眉图');
+        }
       });
 
       await check(`${testCase.name}: 图片数量符合预期`, async () => {
         const info = await inspect(result.buffer);
-        if (config.background || config.overlay) {
+        const writesImage =
+          config.background || config.printImage || (config.overlay && config.overlayType !== 'text');
+        if (writesImage) {
           assert.ok(info.media.length > baseline.media, '应写入水印图片');
         } else {
           assert.equal(info.media.length, baseline.media, '仅打印水印时不应写入图片');
@@ -465,7 +820,14 @@ async function main() {  await rm(OUT, { recursive: true, force: true });
         assert.ok(occurrences <= 1, '<headerFooter> 被重复插入');
         const oddHeaders = (xml.match(/<oddHeader>/g) || []).length;
         assert.ok(oddHeaders <= 1, '<oddHeader> 被重复插入');
+        const legacyHf = (xml.match(/<legacyDrawingHF/g) || []).length;
+        assert.ok(legacyHf <= 1, '<legacyDrawingHF> 被重复插入');
       }
+      await assertPrintImageStructure(twice.buffer);
+      const vml = await (await inspect(twice.buffer)).zip
+        .file('xl/drawings/vmlDrawing1.vml')
+        .async('string');
+      assert.equal((vml.match(/<v:shape /g) || []).length, 1, 'VML 里出现了重复的页眉形状');
     });
 
     if (analysis.sheets.length > 1) {
@@ -495,9 +857,12 @@ async function main() {  await rm(OUT, { recursive: true, force: true });
   }
 
   /* ---------------- 与 openpyxl 交叉验证 ---------------- */
+  // 这一组专门验证「页眉文字水印」，因此关闭默认的页眉图片水印
   const config = normalizeConfig({
     text: '机密文件',
     background: true,
+    overlay: false,
+    printImage: false,
     printHeader: true,
     sheets: 'all',
     color: '#ff0000',

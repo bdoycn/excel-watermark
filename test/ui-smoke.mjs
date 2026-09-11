@@ -111,24 +111,46 @@ async function main() {
     await check('字体下拉框已填充', () => {
       assert.ok($('wm-font').options.length >= 5, `font options: ${$('wm-font').options.length}`);
     });
-    await check('默认参数已写入表单（默认覆盖水印）', () => {
+    await check('默认参数已写入表单（默认：单元格后方 + 打印水印）', () => {
       assert.equal($('wm-text').value, '内部资料');
       assert.equal($('wm-print-size-out').textContent, '22pt');
       assert.equal($('wm-opacity-out').textContent, '30%');
-      assert.equal($('wm-overlay').checked, true);
-      assert.equal($('wm-background').checked, false);
-      assert.equal($('normal-view-row').hidden, true);
-      assert.equal($('wm-print').checked, true);
+      assert.equal($('wm-background').checked, true);
+      assert.equal($('wm-overlay').checked, false);
+      assert.equal($('normal-view-row').hidden, false);
+      assert.equal($('overlay-warning').hidden, true);
+      assert.equal($('wm-print-image').checked, true);
+      assert.match($('print-preview-title').textContent, /页眉图片/);
     });
     await check('预览请求携带正确的默认参数', () => {
       const cfg = lastPreviewConfig();
-      assert.equal(cfg.overlay, true);
-      assert.equal(cfg.background, false);
-      assert.equal(cfg.printHeader, true);
+      assert.equal(cfg.background, true);
+      assert.equal(cfg.overlay, false);
+      assert.equal(cfg.switchToNormalView, true);
+      assert.equal(cfg.printImage, true);
+      assert.equal(cfg.printHeader, false);
     });
-    await check('工作表预览层位于单元格上方', () => {
-      assert.equal($('watermark-layer').classList.contains('is-overlay'), true);
-      assert.match($('sheet-preview-title').textContent, /覆盖在单元格上方/);
+    await check('打印预览使用图片水印平铺', () => {
+      assert.equal($('page-mock').classList.contains('is-image-watermark'), true);
+      assert.match($('page-mock').style.backgroundImage, /blob:jsdom-fake/);
+      assert.equal($('page-header-preview').hidden, true);
+    });
+    await check('切到页眉文字水印后预览与参数同步', async () => {
+      $('wm-print-text').checked = true;
+      $('wm-print-text').dispatchEvent(new window.Event('change'));
+      await sleep(400);
+      assert.equal(lastPreviewConfig().printHeader, true);
+      assert.equal(lastPreviewConfig().printImage, false);
+      assert.equal($('page-mock').classList.contains('is-image-watermark'), false);
+      assert.equal($('page-header-preview').hidden, false);
+      assert.match($('print-preview-title').textContent, /页眉文字/);
+      $('wm-print-image').checked = true;
+      $('wm-print-image').dispatchEvent(new window.Event('change'));
+      await sleep(300);
+    });
+    await check('默认预览层位于单元格后方（不拦截鼠标）', () => {
+      assert.equal($('watermark-layer').classList.contains('is-overlay'), false);
+      assert.match($('sheet-preview-title').textContent, /位于单元格后方/);
     });
     await check('模拟工作表已生成', () => {
       assert.equal(window.document.querySelectorAll('#sheet-table tr').length, 9);
@@ -175,21 +197,31 @@ async function main() {
       assert.equal($('wm-rotate-out').textContent, '45°');
     });
 
-    await check('切换到背景水印会显示普通视图选项', async () => {
-      $('wm-background').checked = true;
-      $('wm-background').dispatchEvent(new window.Event('change'));
-      await sleep(500);
-      assert.equal($('normal-view-row').hidden, false);
-      assert.equal($('watermark-layer').classList.contains('is-overlay'), false);
-      const cfg = lastPreviewConfig();
-      assert.equal(cfg.background, true);
-      assert.equal(cfg.overlay, false);
-      assert.equal(cfg.switchToNormalView, true);
-      // 切回覆盖水印继续后续流程
+    await check('切换到「覆盖·文字」不加警告，参数正确', async () => {
       $('wm-overlay').checked = true;
       $('wm-overlay').dispatchEvent(new window.Event('change'));
+      await sleep(500);
+      const cfg = lastPreviewConfig();
+      assert.equal(cfg.overlay, true);
+      assert.equal(cfg.overlayType, 'text');
+      assert.equal(cfg.background, false);
+      assert.equal($('overlay-warning').hidden, true, '文字覆盖不应提示拦截鼠标');
+      assert.equal($('watermark-layer').classList.contains('is-overlay'), true);
+    });
+    await check('切换到「覆盖·图片」会给出拦截鼠标的警告', async () => {
+      $('wm-overlay-image').checked = true;
+      $('wm-overlay-image').dispatchEvent(new window.Event('change'));
+      await sleep(500);
+      const cfg = lastPreviewConfig();
+      assert.equal(cfg.overlayType, 'image');
+      assert.equal($('overlay-warning').hidden, false);
+      assert.match($('overlay-warning').textContent, /拦截鼠标/);
+      // 切回默认的背景水印继续后续流程
+      $('wm-background').checked = true;
+      $('wm-background').dispatchEvent(new window.Event('change'));
       await sleep(400);
-      assert.equal(lastPreviewConfig().overlay, true);
+      assert.equal($('overlay-warning').hidden, true);
+      assert.equal(lastPreviewConfig().background, true);
     });
 
     $('generate').click();

@@ -8,8 +8,14 @@
  *
  * 全程只做「新增/替换少量元素」，不改动任何单元格、样式、图表等原有内容。
  */
+import crypto from 'node:crypto';
 import JSZip from 'jszip';
-import { renderWatermarkPattern, renderWatermarkTile } from './watermark-image.js';
+import {
+  defaultFontFamily,
+  renderWatermarkPattern,
+  renderWatermarkTile,
+  resolveFontFamily,
+} from './watermark-image.js';
 import {
   XML_DECL,
   NS_PACKAGE_RELATIONSHIPS,
@@ -36,6 +42,7 @@ const REL_TYPE = {
   chartsheet: `${REL_BASE}/chartsheet`,
   dialogsheet: `${REL_BASE}/dialogsheet`,
   drawing: `${REL_BASE}/drawing`,
+  vmlDrawing: `${REL_BASE}/vmlDrawing`,
 };
 
 const NS_DRAWING = 'http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing';
@@ -88,6 +95,11 @@ const HEADER_FOOTER_ORDER = AFTER_HEADER_FOOTER;
 
 /** <drawing> 必须位于这些元素之前（drawing 排在 legacyDrawing / picture 之前） */
 const DRAWING_ORDER = ['legacyDrawing', 'legacyDrawingHF', 'drawingHF', 'picture', ...PICTURE_ORDER];
+
+/** <legacyDrawingHF> 必须位于这些元素之前 */
+const LEGACY_HF_ORDER = ['drawingHF', 'picture', ...PICTURE_ORDER];
+
+const VML_CONTENT_TYPE = 'application/vnd.openxmlformats-officedocument.vmlDrawing';
 
 /** <pageMargins> 必须位于这些元素之前 */
 const PAGE_MARGINS_ORDER = ['pageSetup', 'headerFooter', ...AFTER_HEADER_FOOTER];
@@ -274,6 +286,7 @@ async function readSheets(zip) {
     const part = rel?.target ? resolveTarget(workbookPart, rel.target) : null;
     sheets.push({
       name,
+      sheetId: Number(getAttr(node.openTag, 'sheetId')) || sheets.length + 1,
       state: getAttr(node.openTag, 'state') || 'visible',
       kind,
       relId,
@@ -296,7 +309,7 @@ export async function analyzeWorkbook(buffer) {
     throw new Error('不是有效的 .xlsx / .xlsm 文件（CSV、.xls 暂不支持）');
   }
   const zip = await JSZip.loadAsync(buffer);
-  const { sheets } = await readSheets(zip);
+  const { sheets, workbookPart } = await readSheets(zip);
   return {
     sheets: sheets.map((sheet) => ({
       name: sheet.name,
@@ -333,9 +346,20 @@ function headerFooterChildText(elementXml, name) {
   return m ? m[1] : '';
 }
 
-/** 在 <headerFooter> 中追加居中水印文字（保留原有页眉页脚内容） */
-function applyPrintWatermark(xml, config) {
-  const span = buildHeaderSpan(config);
+/** 在 headerFooter 的属性里设置一个属性（不存在则追加） */
+function setHeaderFooterAttribute(attrs, name, value) {
+  const re = new RegExp(`\\s${name}\\s*=\\s*"[^"]*"`);
+  if (re.test(attrs)) return attrs.replace(re, ` ${name}="${value}"`);
+  const trimmed = attrs.replace(/\s*$/, '');
+  return `${trimmed ? ` ${trimmed.trim()}` : ''} ${name}="${value}"`;
+}
+
+/**
+ * 往 <headerFooter> 里写入一段页眉片段（水印文字 或 &G 图片占位），保留原有页眉页脚内容。
+ * @param {string} span 例如 `&C内部资料` 或 `&C&G`
+ * @param {string} [extraAttributes] 追加到 headerFooter 上的属性（如 scaleWithDoc="0"）
+ */
+function applyHeaderSnippet(xml, span, extraAttributes = '') {
   let root = parseDocument(xml);
 
   if (!findChild(root, 'pageMargins')) {
@@ -345,11 +369,14 @@ function applyPrintWatermark(xml, config) {
 
   const existing = findChild(root, 'headerFooter');
   if (!existing) {
-    const snippet = `<headerFooter><oddHeader>${escapeXmlText(span)}</oddHeader></headerFooter>`;
+    let attrs = extraAttributes.trim();
+    attrs = attrs ? ` ${attrs}` : '';
+    const snippet = `<headerFooter${attrs}><oddHeader>${escapeXmlText(span)}</oddHeader></headerFooter>`;
     return insertChildOrdered(xml, root, HEADER_FOOTER_ORDER, snippet);
   }
 
-  const flag = (name) => ['1', 'true'].includes(String(getAttr(existing.openTag, name) || '').toLowerCase());
+  const flag = (name) =>
+    ['1', 'true'].includes(String(getAttr(existing.openTag, name) || '').toLowerCase());
   const targets = ['oddHeader'];
   if (flag('differentOddEven')) targets.push('evenHeader');
   if (flag('differentFirst')) targets.push('firstHeader');
@@ -360,23 +387,378 @@ function applyPrintWatermark(xml, config) {
     if (found) pieces.set(name, found);
   }
 
+  const wantsGraphic = span.includes('&G');
   for (const name of targets) {
     const previous = pieces.get(name);
-    if (previous) {
-      const text = unescapeXml(headerFooterChildText(previous, name));
-      const merged = text ? `${text}\n${span}` : span;
-      pieces.set(name, `<${name}>${escapeXmlText(merged)}</${name}>`);
+    const current = previous ? unescapeXml(headerFooterChildText(previous, name)) : '';
+    let merged;
+    if (!current) {
+      merged = span;
+    } else if (wantsGraphic && current.includes('&G')) {
+      merged = current; // 已经写过图片占位，避免重复
     } else {
-      pieces.set(name, `<${name}>${escapeXmlText(span)}</${name}>`);
+      merged = `${current}\n${span}`;
     }
+    pieces.set(name, `<${name}>${escapeXmlText(merged)}</${name}>`);
   }
 
   const inner = HEADER_FOOTER_CHILDREN.filter((name) => pieces.has(name))
     .map((name) => pieces.get(name))
     .join('');
-  const rebuilt = `<headerFooter${tagAttributes(existing.openTag)}>${inner}</headerFooter>`;
+  let attrs = tagAttributes(existing.openTag);
+  for (const pair of extraAttributes.trim().split(/\s+(?=[\w:.-]+\s*=)/)) {
+    const m = /^([\w:.-]+)\s*=\s*"([^"]*)"$/.exec(pair.trim());
+    if (m) attrs = setHeaderFooterAttribute(attrs, m[1], m[2]);
+  }
+  const rebuilt = `<headerFooter${attrs}>${inner}</headerFooter>`;
   return replaceChild(xml, existing, rebuilt);
 }
+
+/** 页眉文字水印 */
+function applyPrintWatermark(xml, config) {
+  return applyHeaderSnippet(xml, buildHeaderSpan(config));
+}
+
+/* ------------------------------------------------------------------ */
+/* 保护工作表 + 锁定水印对象                                            */
+/* ------------------------------------------------------------------ */
+
+/** sheetProtection 必须位于这些元素之前（CT_Worksheet 顺序） */
+const SHEET_PROTECTION_ORDER = [
+  'protectedRanges',
+  'scenarios',
+  'autoFilter',
+  'sortState',
+  'dataConsolidate',
+  'customSheetViews',
+  'mergeCells',
+  'phoneticPr',
+  'conditionalFormatting',
+  'dataValidations',
+  'hyperlinks',
+  'printOptions',
+  'pageMargins',
+  'pageSetup',
+  'headerFooter',
+  'rowBreaks',
+  'colBreaks',
+  'customProperties',
+  'cellWatches',
+  'ignoredErrors',
+  'smartTags',
+  'drawing',
+  'legacyDrawing',
+  'legacyDrawingHF',
+  'drawingHF',
+  'picture',
+  'oleObjects',
+  'controls',
+  'webPublishItems',
+  'AlternateContent',
+  'tableParts',
+  'extLst',
+];
+
+/**
+ * 把所有单元格样式改成「未锁定」，这样即使工作表被保护，用户依然可以正常输入编辑。
+ * 参考 xlsxwriter/Excel 的写法：<xf ... applyProtection="1"><protection locked="0"/></xf>
+ */
+async function unlockAllCells(zip) {
+  const part = 'xl/styles.xml';
+  const xml = await readText(zip, part);
+  if (!xml) return 0;
+
+  let unlocked = 0;
+
+  const updated = xml.replace(
+    /<(cellXfs|cellStyleXfs)\b[^>]*>[\s\S]*?<\/\1\s*>/g,
+    (section) =>
+      section.replace(
+        /<xf\b([^>]*?)\/>|<xf\b([^>]*?)>([\s\S]*?)<\/xf\s*>/g,
+        (whole, selfClose, open, inner) => {
+          const attrs = selfClose !== undefined ? selfClose : open;
+          const nextAttrs = /\bapplyProtection\s*=/.test(attrs)
+            ? attrs
+            : `${attrs} applyProtection="1"`;
+
+          if (selfClose !== undefined) {
+            unlocked += 1;
+            return `<xf${nextAttrs}><protection locked="0"/></xf>`;
+          }
+          if (/<protection\b/.test(inner)) {
+            if (/locked="0"/.test(inner)) return `<xf${nextAttrs}>${inner}</xf>`;
+            unlocked += 1;
+            return `<xf${nextAttrs}>${inner.replace(
+              /<protection\b[^>]*\/>/,
+              '<protection locked="0"/>',
+            )}</xf>`;
+          }
+          unlocked += 1;
+          // protection 必须排在 alignment 之后、extLst 之前
+          const withElement = /<extLst\b/.test(inner)
+            ? inner.replace(/<extLst\b/, '<protection locked="0"/><extLst')
+            : `${inner}<protection locked="0"/>`;
+          return `<xf${nextAttrs}>${withElement}</xf>`;
+        },
+      ),
+  );
+
+  if (unlocked > 0) zip.file(part, updated);
+  return unlocked;
+}
+
+/** 给工作表加上保护设置：对象锁定（水印选不中），其余操作尽量放开 */
+function applySheetProtection(xml) {
+  const root = parseDocument(xml);
+  if (findChild(root, 'sheetProtection')) return xml; // 已有保护设置就不动它
+
+  const attributes = [
+    'sheet="1"',
+    'objects="1"', // 关键：锁定对象 → 水印不能被选中/拖动，鼠标落到单元格
+    'scenarios="0"',
+    'formatCells="0"',
+    'formatColumns="0"',
+    'formatRows="0"',
+    'insertColumns="0"',
+    'insertRows="0"',
+    'insertHyperlinks="0"',
+    'deleteColumns="0"',
+    'deleteRows="0"',
+    'sort="0"',
+    'autoFilter="0"',
+    'pivotTables="0"',
+  ].join(' ');
+  return insertChildOrdered(
+    xml,
+    root,
+    SHEET_PROTECTION_ORDER,
+    `<sheetProtection ${attributes}/>`,
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* 覆盖水印（浮动文字 / 艺术字，无填充无边框）                          */
+/* ------------------------------------------------------------------ */
+
+/** 文本水印里空格宽度约为字号的 0.5 倍 */
+function padSpaces(count) {
+  return ' '.repeat(Math.max(1, Math.min(40, Math.round(count))));
+}
+
+/** 把水印文字铺成若干行，形成平铺效果 */
+function buildOverlayLines(config, width, height) {
+  const fontPx = config.fontSize;
+  const lineHeight = fontPx * 1.35;
+  const lines = Math.max(1, Math.min(40, Math.round(height / lineHeight)));
+  const source = config.text.replace(/\n+/g, ' ').trim() || config.text;
+  const chars = [...source].length;
+  const textWidth = Math.max(fontPx, chars * fontPx);
+  const gapPx = Math.max(0, config.gap);
+  const perLine = Math.max(1, Math.min(60, Math.floor(width / (textWidth + gapPx))));
+  const gap = padSpaces(gapPx / (fontPx * 0.5));
+  const line = Array.from({ length: perLine }, () => source).join(gap);
+  return Array.from({ length: lines }, () => line);
+}
+
+/** 浮动文字水印：无填充、无边框的文本框（护眼模式下也能显示，且是真文字不是图片） */
+function buildTextOverlayAnchor({ prefix, shapeId, config, width, height, fontName }) {
+  const p = prefix;
+  const cx = Math.round(width * EMU_PER_PIXEL);
+  const cy = Math.round(height * EMU_PER_PIXEL);
+  const rot = Math.round(config.rotate * 60000);
+  const size = Math.max(100, Math.round(config.fontSize * 0.75 * 100)); // px -> 百分之一磅
+  const alpha = Math.round(config.opacity * 100000);
+  const color = config.color.replace('#', '').toUpperCase();
+
+  const paragraphs = buildOverlayLines(config, width, height)
+    .map(
+      (line) =>
+        '<a:p><a:pPr algn="ctr"/>' +
+        '<a:r><a:rPr lang="zh-CN" altLang="en-US" sz="' +
+        size +
+        '"' +
+        (config.bold ? ' b="1"' : ' b="0"') +
+        (config.italic ? ' i="1"' : ' i="0"') +
+        ' dirty="0"><a:solidFill><a:srgbClr val="' +
+        color +
+        '"><a:alpha val="' +
+        alpha +
+        '"/></a:srgbClr></a:solidFill>' +
+        `<a:latin typeface="${escapeXml(fontName)}"/><a:ea typeface="${escapeXml(fontName)}"/>` +
+        `<a:cs typeface="${escapeXml(fontName)}"/></a:rPr><a:t>${escapeXml(line)}</a:t></a:r></a:p>`,
+    )
+    .join('');
+
+  return (
+    `<${p}oneCellAnchor>` +
+    `<${p}from><${p}col>0</${p}col><${p}colOff>0</${p}colOff><${p}row>0</${p}row><${p}rowOff>0</${p}rowOff></${p}from>` +
+    `<${p}ext cx="${cx}" cy="${cy}"/>` +
+    `<${p}sp macro="" textlink="">` +
+    `<${p}nvSpPr><${p}cNvPr id="${shapeId}" name="Watermark"/>` +
+    `<${p}cNvSpPr txBox="1"><a:spLocks noSelect="1" noTextEdit="1" noMove="1" noResize="1"/></${p}cNvSpPr></${p}nvSpPr>` +
+    `<${p}spPr><a:xfrm rot="${rot}"><a:off x="0" y="0"/><a:ext cx="${cx}" cy="${cy}"/></a:xfrm>` +
+    '<a:prstGeom prst="rect"><a:avLst/></a:prstGeom><a:noFill/><a:ln><a:noFill/></a:ln>' +
+    `</${p}spPr>` +
+    `<${p}txBody><a:bodyPr vertOverflow="overflow" horzOverflow="overflow" wrap="square"` +
+    ' lIns="0" tIns="0" rIns="0" bIns="0" anchor="ctr"><a:noAutofit/></a:bodyPr><a:lstStyle/>' +
+    paragraphs +
+    `</${p}txBody></${p}sp><${p}clientData/></${p}oneCellAnchor>`
+  );
+}
+
+/** 把浮动文字水印挂到 drawing 部件上（复用/替换旧锚点） */
+async function appendOverlayShape(zip, drawingPart, options) {
+  const prepared = prepareDrawingPart(await readText(zip, drawingPart));
+  let drawingXml = prepared.xml;
+  const previous = findOverlayAnchor(drawingXml);
+  if (previous) drawingXml = drawingXml.replace(previous.block, '');
+  const shapeId = previous?.pictureId ?? nextPictureId(drawingXml);
+  const anchor = buildTextOverlayAnchor({
+    prefix: prepared.elementPrefix,
+    shapeId,
+    ...options,
+  });
+  const closeTag = new RegExp(`</${prepared.elementPrefix}wsDr\\s*>`);
+  if (!closeTag.test(drawingXml)) throw new Error('drawing 部件格式异常，无法写入文字水印');
+  drawingXml = drawingXml.replace(closeTag, (match) => `${anchor}${match}`);
+  zip.file(drawingPart, drawingXml);
+  return { shapeId };
+}
+
+/* ------------------------------------------------------------------ */
+/* WPS 原生水印元数据                                                  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * WPS 表格的水印不是靠标准 OOXML 实现的：
+ *  - xl/media/*.png + <picture> 只是给其他软件看的背景图
+ *  - customXml/itemN.xml 里的 https://www.wps.cn/.../etCustomData 才是 WPS 自己渲染的水印，
+ *    WPS 会据此在「普通视图 / 分页预览 / 页面布局 / 打印」里都绘制水印。
+ * 这里复刻 WPS 自己的输出结构，让生成的文件在 WPS 里表现为原生水印。
+ */
+const WPS_NS = 'http://www.wps.cn/officeDocument/2017/etCustomData';
+const CUSTOM_XML_REL = `${REL_BASE}/customXml`;
+const CUSTOM_XML_PROPS_REL = `${REL_BASE}/customXmlProps`;
+const CUSTOM_XML_PROPS_CONTENT_TYPE =
+  'application/vnd.openxmlformats-officedocument.customXmlProperties+xml';
+
+/** 浮动文字水印用的字体名（Excel/WPS 自己渲染，不需要本机注册） */
+function shapeFontName(family) {
+  const value = String(family || '').trim();
+  const generics = new Set(['sans-serif', 'serif', 'monospace', 'system-ui', defaultFontFamily()]);
+  if (value && !generics.has(value)) return value;
+  if (process.platform === 'darwin') return 'PingFang SC';
+  if (process.platform === 'win32') return '微软雅黑';
+  return 'Noto Sans CJK SC';
+}
+
+/** WPS 元数据里需要的字体名（把我们内部的字体族换成 WPS 认识的字体名） */
+function wpsFontName(family) {
+  const value = String(family || '').trim();
+  const generics = new Set(['sans-serif', 'serif', 'monospace', 'system-ui', defaultFontFamily()]);
+  if (value && !generics.has(value)) return value;
+  if (process.platform === 'darwin') return 'PingFang SC';
+  if (process.platform === 'win32') return '宋体';
+  return 'Noto Sans CJK SC';
+}
+
+async function ensureContentTypeOverride(zip, part, contentType) {
+  const contentPart = '[Content_Types].xml';
+  const xml = await readText(zip, contentPart);
+  if (!xml) throw new Error('缺少 [Content_Types].xml，文件可能已损坏');
+  const escaped = part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  if (new RegExp(`PartName="${escaped}"`, 'i').test(xml)) return;
+  const snippet = `<Override PartName="${part}" ContentType="${contentType}"/>`;
+  zip.file(contentPart, xml.replace(/<\/Types\s*>/, `${snippet}</Types>`));
+}
+
+async function applyWpsWatermarkMetadata(zip, config, sheets, workbookPart) {
+  // 选一个部件序号：优先复用已有的 WPS 水印部件，否则用第一个空位
+  let index = null;
+  let reused = false;
+  for (let candidate = 1; candidate <= 50; candidate += 1) {
+    const file = zip.file(`customXml/item${candidate}.xml`);
+    if (!file) {
+      index = candidate;
+      break;
+    }
+    const xml = await file.async('string');
+    if (xml.includes(WPS_NS)) {
+      index = candidate;
+      reused = true;
+      break;
+    }
+  }
+  if (index === null) index = 1;
+
+  const fontName = wpsFontName(resolveFontFamily(config.fontFamily, config.text).family);
+  const fontSize = Number((config.fontSize * 0.75).toFixed(6)); // px -> pt
+  const opacity = Number(config.opacity.toFixed(6));
+  const text = config.text.replace(/\s+/g, ' ').trim();
+
+  const signature = crypto
+    .createHash('md5')
+    .update(`${text}|${fontName}|${config.rotate}|${fontSize}|${opacity}`)
+    .digest('hex');
+
+  const invalid = sheets
+    .map((sheet) => `<invalidBgImg stId="${sheet.sheetId}" hash="${signature}"/>`)
+    .join('');
+  const invalidBlock = config.wpsInvalidateBgImgs ? `<invalidBgImgs>${invalid}</invalidBgImgs>` : '';
+  const item = `${XML_DECL}<watermarks xmlns="${WPS_NS}"><watermark type="0">` +
+    `<text fontName="${escapeXml(fontName)}" angle="${config.rotate}"` +
+    ` fontSize="${fontSize.toFixed(6)}" opacity="${opacity.toFixed(6)}">` +
+    `<v>${escapeXml(text)}</v></text></watermark>${invalidBlock}</watermarks>`;
+
+  zip.file(`customXml/item${index}.xml`, item);
+  zip.file(
+    `customXml/itemProps${index}.xml`,
+    `${XML_DECL}<ds:datastoreItem ds:itemID="{${crypto.randomUUID().toUpperCase()}}"` +
+      ' xmlns:ds="http://schemas.openxmlformats.org/officeDocument/2006/customXml">' +
+      `<ds:schemaRefs><ds:schemaRef ds:uri="${WPS_NS}"/>` +
+      '<ds:schemaRef ds:uri="http://schemas.openxmlformats.org/spreadsheetml/2006/main"/>' +
+      '</ds:schemaRefs></ds:datastoreItem>',
+  );
+  zip.file(
+    `customXml/_rels/item${index}.xml.rels`,
+    `${XML_DECL}<Relationships xmlns="${NS_PACKAGE_RELATIONSHIPS}">` +
+      `<Relationship Id="rId1" Type="${CUSTOM_XML_PROPS_REL}" Target="itemProps${index}.xml"/>` +
+      '</Relationships>',
+  );
+  await ensureContentTypeOverride(
+    zip,
+    `/customXml/itemProps${index}.xml`,
+    CUSTOM_XML_PROPS_CONTENT_TYPE,
+  );
+
+  // WPS 把水印部件挂在 xl/_rels/workbook.xml.rels 上（type=.../customXml），
+  // 少了这条关系 WPS 读不到水印描述，就会完全不画水印
+  const itemPart = `customXml/item${index}.xml`;
+  const workbookRelsPart = relsPathFor(workbookPart);
+  const workbookRels = (await readText(zip, workbookRelsPart)) || emptyRels();
+  const alreadyLinked = (workbookRels.match(/<Relationship\b[^>]*\/?>/g) || []).some((tag) => {
+    if (!getAttr(tag, 'Type').endsWith('/customXml')) return false;
+    const target = getAttr(tag, 'Target');
+    return target && resolveTarget(workbookPart, target) === itemPart;
+  });
+  if (!alreadyLinked) {
+    zip.file(
+      workbookRelsPart,
+      addRelationship(
+        workbookRels,
+        nextRelationshipId(workbookRels),
+        CUSTOM_XML_REL,
+        relativeTarget(workbookPart, itemPart),
+      ),
+    );
+  }
+
+  return { index, reused, fontName, text, invalidateBgImgs: Boolean(config.wpsInvalidateBgImgs) };
+}
+
+/* ------------------------------------------------------------------ */
+/* 背景图片与覆盖水印的公共工具                                        */
+/* ------------------------------------------------------------------ */
 
 async function ensurePngContentType(zip) {
   const part = '[Content_Types].xml';
@@ -673,20 +1055,260 @@ async function appendOverlayAnchor(zip, drawingPart, imagePart, width, height) {
   return { relationshipId: imageRid, pictureId };
 }
 
-/** 背景水印只在普通视图可见，这里把分页预览 / 页面布局视图改回普通视图 */
-function switchToNormalView(xml) {
+/* ------------------------------------------------------------------ */
+/* 打印水印（页眉图片，&G + VML）                                       */
+/* ------------------------------------------------------------------ */
+
+/** 常见纸张尺寸（磅，纵向）：paperSize -> [宽, 高] */
+const PAPER_SIZES = {
+  1: [612, 792],
+  3: [792, 1224],
+  4: [1224, 1584],
+  5: [612, 1008],
+  7: [522, 756],
+  8: [841.89, 1190.55],
+  9: [595.28, 841.89],
+  11: [419.53, 595.28],
+  12: [728.5, 1035.4],
+  13: [515.9, 728.5],
+};
+
+/** Excel/xlsxwriter 使用的 VML 图片形状定义 */
+const VML_SHAPETYPE =
+  '<v:shapetype id="_x0000_t75" coordsize="21600,21600" o:spt="75" o:preferrelative="t" ' +
+  'path="m@4@5l@4@11@9@11@9@5xe" filled="f" stroked="f"><v:stroke joinstyle="miter"/>' +
+  '<v:formulas><v:f eqn="if lineDrawn pixelLineWidth 0"/><v:f eqn="sum @0 1 0"/>' +
+  '<v:f eqn="sum 0 0 @1"/><v:f eqn="prod @2 1 2"/><v:f eqn="prod @3 21600 pixelWidth"/>' +
+  '<v:f eqn="prod @3 21600 pixelHeight"/><v:f eqn="sum @0 0 1"/><v:f eqn="prod @6 1 2"/>' +
+  '<v:f eqn="prod @7 21600 pixelWidth"/><v:f eqn="sum @8 21600 0"/>' +
+  '<v:f eqn="prod @7 21600 pixelHeight"/><v:f eqn="sum @10 21600 0"/></v:formulas>' +
+  '<v:path o:extrusionok="f" gradientshapeok="t" o:connecttype="rect"/>' +
+  '<o:lock v:ext="edit" aspectratio="t"/></v:shapetype>';
+
+const VML_HEADER =
+  '<xml xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office"' +
+  ' xmlns:x="urn:schemas-microsoft-com:office:excel">' +
+  '<o:shapelayout v:ext="edit"><o:idmap v:ext="edit" data="1"/></o:shapelayout>' +
+  VML_SHAPETYPE;
+
+/** 页眉图片形状（id=CH 表示居中页眉，与 Excel/xlsxwriter 一致） */
+function buildVmlShape({ relId, title, width, height }) {
+  const w = Math.round(width * 100) / 100;
+  const h = Math.round(height * 100) / 100;
+  return (
+    `<v:shape id="CH" o:spid="_x0000_s1025" type="#_x0000_t75" style="position:absolute;` +
+    `margin-left:0;margin-top:0;width:${w}pt;height:${h}pt;z-index:1">` +
+    `<v:imagedata o:relid="${relId}" o:title="${escapeXml(title)}"/>` +
+    '<o:lock v:ext="edit" rotation="t"/></v:shape>'
+  );
+}
+
+function buildVmlDocument(shapeXml) {
+  return `${VML_HEADER}${shapeXml}</xml>`;
+}
+
+/** 按页面尺寸与页边距算出打印水印应该铺多大（磅） */
+function computePrintBox(xml) {
   const root = parseDocument(xml);
-  const views = findChild(root, 'sheetViews');
-  if (!views) return xml;
+  const setup = findChild(root, 'pageSetup');
+  const margins = findChild(root, 'pageMargins');
+  const paperSize = setup ? Number(getAttr(setup.openTag, 'paperSize')) : 9;
+  let [pageWidth, pageHeight] = PAPER_SIZES[paperSize] || PAPER_SIZES[9];
+  const orientation = setup ? getAttr(setup.openTag, 'orientation') || 'portrait' : 'portrait';
+  if (orientation === 'landscape') [pageWidth, pageHeight] = [pageHeight, pageWidth];
+  if (orientation === 'portrait' && pageWidth > pageHeight) {
+    [pageWidth, pageHeight] = [pageHeight, pageWidth];
+  }
+
+  const inches = (name, fallback) => {
+    const value = margins ? Number(getAttr(margins.openTag, name)) : Number.NaN;
+    return Number.isFinite(value) ? value : fallback;
+  };
+  const left = inches('left', 0.7);
+  const right = inches('right', 0.7);
+  const bottom = inches('bottom', 0.75);
+  const header = inches('header', 0.3);
+
+  const width = Math.max(160, pageWidth - (left + right) * 72);
+  // 图片从页眉位置开始向下铺，一直铺到页面下边距
+  const height = Math.max(160, pageHeight - (header + bottom) * 72);
+  return { width, height, headerMargin: header };
+}
+
+async function ensureVmlContentType(zip) {
+  const part = '[Content_Types].xml';
+  let xml = await readText(zip, part);
+  if (!xml) throw new Error('缺少 [Content_Types].xml，文件可能已损坏');
+  if (/<Default\b[^>]*Extension\s*=\s*["']vml["']/i.test(xml)) return;
+  const snippet = `<Default Extension="vml" ContentType="${VML_CONTENT_TYPE}"/>`;
+  const overrideIndex = xml.search(/<Override\b/i);
+  xml =
+    overrideIndex !== -1
+      ? `${xml.slice(0, overrideIndex)}${snippet}${xml.slice(overrideIndex)}`
+      : xml.replace(/<\/Types\s*>/, `${snippet}</Types>`);
+  zip.file(part, xml);
+}
+
+/**
+ * 打印水印：把与工作表水印一致的平铺图作为「页眉图片」写入（&G + VML），
+ * 打印时每页都会出现，而且不是浮动对象，不会拦截鼠标。
+ */
+async function applyPrintImage(zip, sheet, sheetXml, sheetRelsXml, config, cache) {
+  const box = computePrintBox(sheetXml);
+  const cacheKey = `${Math.round(box.width)}x${Math.round(box.height)}`;
+  let image = cache.get(cacheKey);
+  if (!image) {
+    const pixelWidth = Math.round((box.width * 96) / 72);
+    const pixelHeight = Math.round((box.height * 96) / 72);
+    const scale = Math.min(
+      1,
+      OVERLAY_MAX_SIDE / pixelWidth,
+      OVERLAY_MAX_SIDE / pixelHeight,
+      Math.sqrt(OVERLAY_MAX_PIXELS / (pixelWidth * pixelHeight)),
+    );
+    const pattern = renderWatermarkPattern(config, pixelWidth, pixelHeight, scale);
+    const part = nextMediaPart(zip);
+    zip.file(part, pattern.buffer, { binary: true, compression: 'STORE' });
+    await ensurePngContentType(zip);
+    image = {
+      part,
+      width: box.width,
+      height: box.height,
+      bytes: pattern.buffer.length,
+      fontFamily: pattern.fontFamily,
+      fontSubstituted: pattern.fontSubstituted,
+    };
+    cache.set(cacheKey, image);
+  }
+
+  // 1) 找到或创建 VML 部件
+  let root = parseDocument(sheetXml);
+  const legacy = findChild(root, 'legacyDrawingHF');
+  let vmlPart = null;
+  let vmlRid = legacy ? getRelationshipId(legacy.openTag) : null;
+  if (vmlRid) {
+    const rel = (sheetRelsXml.match(/<Relationship\b[^>]*\/?>/g) || []).find(
+      (tag) => getAttr(tag, 'Id') === vmlRid,
+    );
+    const target = rel ? getAttr(rel, 'Target') : null;
+    const candidate = target ? resolveTarget(sheet.part, target) : null;
+    if (candidate && zip.file(candidate)) vmlPart = candidate;
+  }
+  if (!vmlPart) {
+    vmlPart = nextPart(zip, 'xl/drawings/vmlDrawing', 'vml');
+    await ensureVmlContentType(zip);
+    const target = relativeTarget(sheet.part, vmlPart);
+    if (vmlRid) {
+      sheetRelsXml = upsertRelationship(sheetRelsXml, vmlRid, REL_TYPE.vmlDrawing, target);
+    } else {
+      vmlRid = nextRelationshipId(sheetRelsXml);
+      sheetRelsXml = addRelationship(sheetRelsXml, vmlRid, REL_TYPE.vmlDrawing, target);
+      sheetXml = insertChildOrdered(
+        sheetXml,
+        parseDocument(sheetXml),
+        LEGACY_HF_ORDER,
+        `<legacyDrawingHF r:id="${vmlRid}"/>`,
+      );
+    }
+  }
+
+  // 2) 写 VML 内容 + 图片关系
+  const vmlRelsPart = relsPathFor(vmlPart);
+  let vmlRels = (await readText(zip, vmlRelsPart)) || emptyRels();
+  const vmlXml = (await readText(zip, vmlPart)) || '';
+  const existingShape = /<v:shape\b[^>]*id="CH"[\s\S]*?<\/v:shape>/.exec(vmlXml);
+  const previousRel = existingShape ? /o:relid="([^"]+)"/.exec(existingShape[0]) : null;
+
+  let imageRid;
+  if (previousRel) {
+    imageRid = previousRel[1];
+    vmlRels = upsertRelationship(
+      vmlRels,
+      imageRid,
+      REL_TYPE.image,
+      relativeTarget(vmlPart, image.part),
+    );
+  } else {
+    imageRid = nextRelationshipId(vmlRels);
+    vmlRels = addRelationship(
+      vmlRels,
+      imageRid,
+      REL_TYPE.image,
+      relativeTarget(vmlPart, image.part),
+    );
+  }
+
+  const shape = buildVmlShape({
+    relId: imageRid,
+    title: 'Watermark',
+    width: image.width,
+    height: image.height,
+  });
+  let nextVml;
+  if (existingShape) {
+    nextVml = vmlXml.replace(existingShape[0], shape);
+  } else if (vmlXml.trim()) {
+    nextVml = /<\/xml\s*>/.test(vmlXml)
+      ? vmlXml.replace(/<\/xml\s*>/, `${shape}</xml>`)
+      : `${vmlXml}${shape}`;
+  } else {
+    nextVml = buildVmlDocument(shape);
+  }
+  zip.file(vmlRelsPart, vmlRels);
+  zip.file(vmlPart, nextVml);
+
+  // 3) 页眉里加入 &G 占位；关闭「随文档缩放」，保证图片按实际页面尺寸打印
+  sheetXml = applyHeaderSnippet(sheetXml, '&C&G', 'scaleWithDoc="0"');
+
+  return { sheetXml, sheetRelsXml, image };
+}
+
+/** 工作表打开时的视图：normal / pageBreakPreview / pageLayout */
+const SHEET_VIEW_MODES = ['normal', 'pageBreakPreview', 'pageLayout'];
+
+/**
+ * 设置工作表的打开视图。
+ * - normal：普通视图（能看到工作表背景水印）
+ * - pageLayout：页面布局（能看到页眉图片水印，且页眉图不是浮动物体）
+ * 参考 rust_xlsxwriter 官方 watermark 示例：页眉图片 + 页面布局视图。
+ */
+function setSheetView(xml, mode) {
+  if (!mode || !SHEET_VIEW_MODES.includes(mode)) return xml;
+  const root = parseDocument(xml);
+  if (!findChild(root, 'sheetViews')) {
+    // 部分文件没有 <sheetViews>，按 schema 顺序补一个（sheetViews 在 sheetFormatPr/cols/sheetData 之前）
+    const tag = mode === 'normal' ? '' : ` view="${mode}"`;
+    return insertChildOrdered(
+      xml,
+      root,
+      ['sheetFormatPr', 'cols', 'sheetData'],
+      `<sheetViews><sheetView${tag} workbookViewId="0"/></sheetViews>`,
+    );
+  }
+
   let changed = false;
   const updated = xml.replace(/<sheetView\b[^>]*>/g, (tag) => {
-    if (!/\bview\s*=\s*"(pageBreakPreview|pageLayout)"/i.test(tag)) return tag;
     changed = true;
-    return tag.replace(/\s*view\s*=\s*"(?:pageBreakPreview|pageLayout)"/i, '');
+    let next = tag.replace(/\s*view\s*=\s*"(?:normal|pageBreakPreview|pageLayout)"/i, '');
+    if (mode !== 'normal') {
+      next = next.replace(/\s*(\/?)>$/, (whole, slash) => ` view="${mode}"${slash ? '/' : ''}>`);
+    }
+    return next;
   });
-  if (!changed) return xml;
-  void views;
-  return updated;
+  return changed ? updated : xml;
+}
+
+/** 计算最终要设置的视图 */
+function resolveViewMode(config) {
+  const mode = String(config.viewMode || 'auto').toLowerCase();
+  if (mode === 'keep') return null;
+  if (mode === 'pagelayout') return 'pageLayout';
+  if (mode === 'pagebreakpreview') return 'pageBreakPreview';
+  if (mode === 'normal') return 'normal';
+  // auto：有背景水印就切普通视图（否则看不到背景图）；只靠页眉图就切页面布局
+  if (config.background && config.switchToNormalView) return 'normal';
+  if (!config.background && config.printImage) return 'pageLayout';
+  return null;
 }
 
 /**
@@ -728,7 +1350,7 @@ export async function watermarkWorkbook(buffer, config) {
   }
 
   const zip = await JSZip.loadAsync(buffer);
-  const { sheets } = await readSheets(zip);
+  const { sheets, workbookPart } = await readSheets(zip);
 
   const wanted = config.sheets === 'all' ? null : new Set(config.sheets);
   const selected = wanted ? sheets.filter((sheet) => wanted.has(sheet.name)) : sheets;
@@ -748,10 +1370,15 @@ export async function watermarkWorkbook(buffer, config) {
     await ensurePngContentType(zip);
   }
 
+  let wps = null;
+  if (config.lockObjects) await unlockAllCells(zip);
+
   const applied = [];
   const skipped = [];
   const overlays = [];
+  const printImages = [];
   const overlayImages = new Map();
+  const printImageCache = new Map();
   for (const sheet of selected) {
     if (!sheet.supported || !sheet.part) {
       skipped.push({
@@ -771,12 +1398,17 @@ export async function watermarkWorkbook(buffer, config) {
     let relsXml = (await readText(zip, relsPart)) || emptyRels();
 
     xml = ensureRelationshipsNs(xml);
-    if (config.printHeader) {
+    if (config.printImage) {
+      const printed = await applyPrintImage(zip, sheet, xml, relsXml, config, printImageCache);
+      xml = printed.sheetXml;
+      relsXml = printed.sheetRelsXml;
+      if (!font) font = { family: printed.image.fontFamily, substituted: printed.image.fontSubstituted };
+      printImages.push(sheet.name);
+    } else if (config.printHeader) {
       xml = applyPrintWatermark(xml, config);
     }
-    if (config.background && config.switchToNormalView) {
-      xml = switchToNormalView(xml);
-    }
+    const targetView = resolveViewMode(config);
+    if (targetView) xml = setSheetView(xml, targetView);
 
     if (config.background) {
       const root = parseDocument(xml);
@@ -805,7 +1437,19 @@ export async function watermarkWorkbook(buffer, config) {
       }
     }
 
-    if (config.overlay) {
+    if (config.overlay && config.overlayType === 'text') {
+      const size = measureSheetPixels(xml);
+      const drawing = await ensureDrawingPart(zip, sheet, xml, relsXml);
+      xml = drawing.sheetXml;
+      relsXml = drawing.sheetRelsXml;
+      await appendOverlayShape(zip, drawing.part, {
+        config,
+        width: size.width,
+        height: size.height,
+        fontName: shapeFontName(config.fontFamily),
+      });
+      overlays.push(sheet.name);
+    } else if (config.overlay) {
       const size = measureSheetPixels(xml);
       const key = `${size.width}x${size.height}`;
       let image = overlayImages.get(key);
@@ -831,9 +1475,18 @@ export async function watermarkWorkbook(buffer, config) {
       overlays.push(sheet.name);
     }
 
+    if (config.lockObjects) xml = applySheetProtection(xml);
+
     zip.file(sheet.part, xml);
     zip.file(relsPart, relsXml);
     applied.push(sheet.name);
+  }
+
+  const processedSheets = selected
+    .filter((sheet) => applied.includes(sheet.name))
+    .map((sheet) => ({ name: sheet.name, sheetId: sheet.sheetId }));
+  if (config.wpsWatermark && processedSheets.length > 0) {
+    wps = await applyWpsWatermarkMetadata(zip, config, processedSheets, workbookPart);
   }
 
   await pruneUnusedMedia(zip);
@@ -851,6 +1504,8 @@ export async function watermarkWorkbook(buffer, config) {
     skipped,
     missing,
     overlays,
+    printImages,
+    wps,
     font,
     tile: tile ? { width: tile.width, height: tile.height, bytes: tile.buffer.length } : null,
   };

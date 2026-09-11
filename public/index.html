@@ -179,33 +179,72 @@
           <fieldset class="radio-group">
             <legend class="field__label">水印位置</legend>
             <label class="radio">
-              <input type="radio" name="wm-position" id="wm-overlay" value="overlay" />
+              <input type="radio" name="wm-position" id="wm-background" value="background" />
               <span class="radio__body">
-                <span class="radio__title">覆盖在单元格上方<span class="tag-recommend">推荐</span></span>
-                <span class="radio__desc">普通视图、分页预览、页面布局都能看到，也会随文件打印。图片已设为不可选中，正常点击单元格不受影响。</span>
+                <span class="radio__title">位于单元格后方（工作表背景）<span class="tag-recommend">推荐</span></span>
+                <span class="radio__desc">不遮挡数据、不拦截鼠标，单元格照常点击输入；只在「普通视图」可见、不能打印，所以会同时把打开视图切回普通视图，打印水印单独用页眉实现。</span>
               </span>
             </label>
             <label class="radio">
-              <input type="radio" name="wm-position" id="wm-background" value="background" />
+              <input type="radio" name="wm-position" id="wm-overlay" value="overlay" />
               <span class="radio__body">
-                <span class="radio__title">位于单元格后方（工作表背景）</span>
-                <span class="radio__desc">完全不遮挡数据；但只在「普通视图」显示、不能打印，分页预览与页面布局视图下看不到。</span>
+                <span class="radio__title">覆盖·文字（艺术字文本框）</span>
+                <span class="radio__desc">在单元格上方浮动一层真文字，护眼模式 / 分页预览 / 页面布局都能看到，也会打印；无填充无边框，鼠标通常只在文字上被挡住。适合「护眼模式下也要看得见」。</span>
+              </span>
+            </label>
+            <label class="radio">
+              <input type="radio" name="wm-position" id="wm-overlay-image" value="overlay-image" />
+              <span class="radio__body">
+                <span class="radio__title">覆盖·图片（平铺图片）<span class="tag-warn">会拦截鼠标</span></span>
+                <span class="radio__desc">效果与背景水印完全一致，但整块图片区域都会接住鼠标，表格需要输入时不要用。</span>
               </span>
             </label>
           </fieldset>
+
+          <p class="font-warning" id="overlay-warning" hidden>
+            覆盖水印是浮动图片，Excel / WPS 会在图片覆盖范围内拦截鼠标点击（点到的是图片而不是单元格）。
+            如果这张表还要输入或编辑，请改用「位于单元格后方」。确实需要覆盖水印时，可在
+            「开始 → 查找和选择 → 选择窗格」里删除名为 Watermark 的对象。
+          </p>
+
+          <label class="switch">
+            <input type="checkbox" id="wm-wps" />
+            <span class="switch__body">
+              <span class="switch__title">写入 WPS 水印元数据（实验性）</span>
+              <span class="switch__desc">按 WPS 私有格式（customXml / etCustomData）写一段水印描述。实测 WPS 12.1 不会读取外部写入的这段描述，默认关闭；保留开关仅用于后续版本验证。</span>
+            </span>
+          </label>
 
           <label class="check" id="normal-view-row" hidden>
             <input type="checkbox" id="wm-normal-view" />
             <span>打开文件时切回普通视图（否则背景水印不可见）</span>
           </label>
 
-          <label class="switch">
-            <input type="checkbox" id="wm-print" />
-            <span class="switch__body">
-              <span class="switch__title">打印水印（页眉文字）</span>
-              <span class="switch__desc">写入页眉居中文字，打印与「页面布局」视图每页显示。原有页眉内容会保留。</span>
-            </span>
-          </label>
+          <fieldset class="radio-group">
+            <legend class="field__label">打印水印</legend>
+            <label class="radio">
+              <input type="radio" name="wm-print" id="wm-print-image" value="image" />
+              <span class="radio__body">
+                <span class="radio__title">页眉图片水印<span class="tag-recommend">推荐</span></span>
+                <span class="radio__desc">把和屏幕一致的水印平铺图放进页眉，按纸张尺寸铺满整页，打印每一页都有；不是浮动对象，不影响鼠标与输入。</span>
+              </span>
+            </label>
+            <label class="radio">
+              <input type="radio" name="wm-print" id="wm-print-text" value="text" />
+              <span class="radio__body">
+                <span class="radio__title">页眉文字水印</span>
+                <span class="radio__desc">只在页眉居中加一行文字，原有页眉页脚内容保留。字号小一些，适合正式单据。</span>
+              </span>
+            </label>
+            <label class="radio">
+              <input type="radio" name="wm-print" id="wm-print-none" value="none" />
+              <span class="radio__body">
+                <span class="radio__title">不打印水印</span>
+                <span class="radio__desc">只在屏幕上显示水印，打印时保持原样。</span>
+              </span>
+            </label>
+          </fieldset>
+
           <div class="grid-2" id="print-options">
             <label class="field" for="wm-print-font">
               <span class="field__label">页眉字体</span>
@@ -269,8 +308,8 @@
         </div>
 
         <div class="preview-block" id="print-preview-block">
-          <h3 class="preview-block__title">打印页眉水印</h3>
-          <figure class="page-mock">
+          <h3 class="preview-block__title" id="print-preview-title">打印水印（页眉图片，每页铺满）</h3>
+          <figure class="page-mock" id="page-mock">
             <div class="page-mock__header" id="page-header-preview">内部资料</div>
             <div class="page-mock__body" aria-hidden="true">
               <span style="width: 68%"></span>
@@ -285,7 +324,9 @@
         <aside class="tips">
           <h3>小贴士</h3>
           <ul>
-            <li>用 Excel 打开时，如果看不到水印，先确认当前是不是「分页预览 / 页面布局」视图：工作表背景图只在「普通视图」显示。</li>
+            <li>默认方案：屏幕用单元格后方的背景水印，打印用页眉图片水印，两者都不是浮动对象，鼠标点击和输入不受影响。</li>
+            <li><b>WPS 护眼模式</b>会在单元格背景之上铺一层护眼色，会把工作表背景水印盖住 —— 这是 WPS 的图层顺序决定的；需要护眼模式下也可见，只能用浮动水印，但那样会吃掉鼠标点击。</li>
+            <li>用 Excel 打开时，如果看不到背景水印，先确认当前是不是「分页预览 / 页面布局」视图：工作表背景图只在「普通视图」显示。</li>
             <li>需要纸质文件也带水印时，请开启「打印水印」。</li>
             <li>覆盖水印已设置为不可选中；若要删除，可在「开始 → 查找和选择 → 选择窗格」中删除名为 Watermark 的对象。</li>
             <li>若所选字体在当前系统缺少部分简体字形（例如苹方、宋体在部分环境不可用），系统会自动换成可用的中文字体，并在预览下方提示。</li>
