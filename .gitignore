@@ -1,0 +1,13 @@
+node_modules/
+.npm-cache/
+tools/pylibs/
+tools/dl/
+tools/ref/
+tools/*.png
+test/out/
+test/fixtures/
+out/
+.env
+.env.local
+.DS_Store
+*.log

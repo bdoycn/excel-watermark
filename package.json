@@ -1,0 +1,28 @@
+{
+  "name": "excel-watermark",
+  "version": "1.0.0",
+  "private": true,
+  "description": "给 Excel(.xlsx/.xlsm) 添加水印的 Node 服务 + 网页界面",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node test/run-tests.mjs && node test/ui-smoke.mjs",
+    "test:core": "node test/run-tests.mjs",
+    "test:ui": "node test/ui-smoke.mjs",
+    "fixtures": "python3 test/make-fixtures.py"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@napi-rs/canvas": "^1.0.9",
+    "jszip": "^3.10.2"
+  },
+  "devDependencies": {
+    "exceljs": "^4.4.0",
+    "jsdom": "^30.0.1",
+    "xlsx": "^0.18.5"
+  }
+}
