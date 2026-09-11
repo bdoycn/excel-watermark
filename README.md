@@ -167,6 +167,7 @@ canvas 只能拿到日文/韩文字体（例如 macOS 上 `PingFang SC` 无法�
 
 ```
 excel-watermark/
+├── LICENSE                    # Apache License 2.0
 ├── server.js                  # HTTP 服务：静态页面 + API
 ├── src/
 │   ├── config.js              # 参数定义、默认值与校验
@@ -234,3 +235,17 @@ npm run test:ui   # 只跑前端 jsdom 冒烟测试
 
 **端口被占用？**
 `PORT=8080 npm start`，或先结束占用进程。
+
+## 许可证
+
+本项目基于 [Apache License 2.0](LICENSE) 授权，完整条款见仓库根目录的 `LICENSE` 文件。
+
+第三方依赖的许可：
+
+| 依赖 | 用途 | 许可 |
+| --- | --- | --- |
+| `@napi-rs/canvas` | 服务端渲染水印平铺图 | MIT |
+| `jszip` | 读写 OOXML（zip）容器 | MIT（或 GPL-3.0-or-later，本项目按 MIT 使用） |
+| `exceljs`（dev） | 测试中校验生成文件 | MIT |
+| `xlsx`（dev） | 测试中校验生成文件 | Apache-2.0 |
+| `jsdom`（dev） | 前端冒烟测试 | MIT |
