@@ -240,6 +240,8 @@ npm run test:ui   # 只跑前端 jsdom 冒烟测试
 
 本项目基于 [Apache License 2.0](LICENSE) 授权，完整条款见仓库根目录的 `LICENSE` 文件。
 
+Copyright 2026 bdoycn
+
 第三方依赖的许可：
 
 | 依赖 | 用途 | 许可 |
